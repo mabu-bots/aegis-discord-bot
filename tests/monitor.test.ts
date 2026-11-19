@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { planNotifications } from "../src/monitor.js";
+import { Monitor, planNotifications } from "../src/monitor.js";
 import type { EewInfo, QuakeInfo, TsunamiInfo } from "../src/sources/p2p.js";
 import { Store } from "../src/store.js";
 
@@ -154,6 +154,123 @@ test("EEW: 推定震度3以下は通知しない", () => {
     NOW,
   );
   assert.equal(plans.length, 0);
+});
+
+test("EEW: 第1報が対象外でも、上方修正された続報は通知する (H-1)", () => {
+  const store = storeWithSub(30, true);
+  const small = planNotifications(
+    store,
+    { quakes: [], tsunamis: [], eews: [eew({ estScale: 30 })] },
+    NOW,
+  );
+  assert.equal(small.length, 0);
+  const grown = planNotifications(
+    store,
+    { quakes: [], tsunamis: [], eews: [eew({ estScale: 45 })] },
+    NOW,
+  );
+  assert.equal(grown.length, 1);
+  assert.equal(grown[0].isUpdate, false);
+});
+
+test("EEW: 通知済みより推定震度が上がった続報だけ再通知する (H-1)", () => {
+  const store = storeWithSub(30, true);
+  const first = planNotifications(store, { quakes: [], tsunamis: [], eews: [eew({ estScale: 45 })] }, NOW);
+  assert.equal(first.length, 1);
+  const same = planNotifications(store, { quakes: [], tsunamis: [], eews: [eew({ estScale: 45 })] }, NOW);
+  assert.equal(same.length, 0);
+  const lower = planNotifications(store, { quakes: [], tsunamis: [], eews: [eew({ estScale: 40 })] }, NOW);
+  assert.equal(lower.length, 0);
+  const grown = planNotifications(store, { quakes: [], tsunamis: [], eews: [eew({ estScale: 50 })] }, NOW);
+  assert.equal(grown.length, 1);
+  assert.equal(grown[0].isUpdate, true);
+});
+
+test("EEW: 発生から15分以上経った初見の速報は通知しない", () => {
+  const store = storeWithSub(30, true);
+  const stale = eew({ originTime: "2026/11/19 05:40:00", time: "2026/11/19 05:40:05" });
+  const plans = planNotifications(store, { quakes: [], tsunamis: [], eews: [stale] }, NOW);
+  assert.equal(plans.length, 0);
+});
+
+test("津波: 発生から15分以上経った初見の情報は通知しない", () => {
+  const store = storeWithSub(30);
+  const t: TsunamiInfo = {
+    kind: "tsunami",
+    id: "t-stale",
+    time: "2026/11/19 05:40:00",
+    cancelled: false,
+    grade: "Warning",
+    areas: [],
+  };
+  const plans = planNotifications(store, { quakes: [], tsunamis: [t], eews: [] }, NOW);
+  assert.equal(plans.length, 0);
+});
+
+function primedStoreWithTwoSubs(): Store {
+  const dir = mkdtempSync(join(tmpdir(), "aegis-bot-test-"));
+  const store = new Store(join(dir, "state.json"));
+  store.upsertSubscription({ guildId: "g1", channelId: "c1", minScale: 30, eew: true, strongMention: false });
+  store.upsertSubscription({ guildId: "g1", channelId: "c2", minScale: 30, eew: true, strongMention: false });
+  planNotifications(store, noAlerts, NOW);
+  return store;
+}
+
+test("Monitor: 送信に失敗した購読分だけ次 tick で再試行する (H-2)", async () => {
+  const store = primedStoreWithTwoSubs();
+  let fetchCount = 0;
+  const sentTo: string[] = [];
+  let c2Failed = false;
+  const monitor = new Monitor(
+    {
+      store,
+      fetchAll: async () => {
+        fetchCount += 1;
+        return fetchCount === 1 ? { quakes: [quake({})], tsunamis: [], eews: [] } : noAlerts;
+      },
+      send: async (plan) => {
+        if (plan.subscription.channelId === "c2" && !c2Failed) {
+          c2Failed = true;
+          throw new Error("送信失敗 (テスト)");
+        }
+        sentTo.push(plan.subscription.channelId);
+      },
+      log: () => undefined,
+      now: () => NOW,
+    },
+    30,
+  );
+  await monitor.tickOnce();
+  assert.deepEqual(sentTo, ["c1"]);
+  await monitor.tickOnce();
+  assert.deepEqual(sentTo, ["c1", "c2"]);
+  await monitor.tickOnce();
+  assert.deepEqual(sentTo, ["c1", "c2"]);
+});
+
+test("Monitor: 届かない通知はリトライ上限で破棄される (H-2)", async () => {
+  const store = primedStoreWithTwoSubs();
+  let fetchCount = 0;
+  let sendCalls = 0;
+  const monitor = new Monitor(
+    {
+      store,
+      fetchAll: async () => {
+        fetchCount += 1;
+        return fetchCount === 1 ? { quakes: [quake({})], tsunamis: [], eews: [] } : noAlerts;
+      },
+      send: async () => {
+        sendCalls += 1;
+        throw new Error("常に失敗 (テスト)");
+      },
+      log: () => undefined,
+      now: () => NOW,
+    },
+    30,
+  );
+  // 初回 + リトライ 3 回 = 購読 2 件 × 4 回で打ち止めになる
+  for (let i = 0; i < 6; i++) await monitor.tickOnce();
+  assert.equal(sendCalls, 8);
 });
 
 test("Store: 購読の追加・削除と永続化", () => {

@@ -33,8 +33,8 @@ async function registerCommands(): Promise<void> {
 async function sendPlanned(plan: PlannedMessage): Promise<void> {
   const channel = await client.channels.fetch(plan.subscription.channelId).catch(() => null);
   if (!channel || !channel.isTextBased() || !("send" in channel)) {
-    console.warn(`通知先チャンネル ${plan.subscription.channelId} が見つかりません`);
-    return;
+    // 正常 return すると Monitor 側で成功扱いになり再試行されないため、例外にする
+    throw new Error(`通知先チャンネル ${plan.subscription.channelId} が見つかりません`);
   }
   const textChannel = channel as TextChannel;
   const alert = plan.alert;
@@ -67,12 +67,31 @@ client.once(Events.ClientReady, (c) => {
     {
       store,
       fetchAll: async () => {
-        const [quakes, tsunamis, eews] = await Promise.all([
+        // 1 つの情報源の失敗で成功した残りまで破棄しないよう allSettled で個別に扱う
+        const [quakes, tsunamis, eews] = await Promise.allSettled([
           fetchQuakes(10),
           fetchTsunamis(5),
           fetchEews(5),
         ]);
-        return { quakes, tsunamis, eews };
+        const names = ["地震情報", "津波情報", "緊急地震速報"];
+        const results = [quakes, tsunamis, eews];
+        results.forEach((r, i) => {
+          if (r.status === "rejected") {
+            console.warn(
+              `${names[i]}の取得に失敗しました: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`,
+            );
+          }
+        });
+        // 全滅したときだけ例外にして Monitor 側のバックオフを効かせる
+        if (results.every((r) => r.status === "rejected")) {
+          const first = results[0];
+          throw first.status === "rejected" ? first.reason : new Error("情報の取得に失敗しました");
+        }
+        return {
+          quakes: quakes.status === "fulfilled" ? quakes.value : [],
+          tsunamis: tsunamis.status === "fulfilled" ? tsunamis.value : [],
+          eews: eews.status === "fulfilled" ? eews.value : [],
+        };
       },
       send: sendPlanned,
       log: (msg) => console.warn(msg),
@@ -98,5 +117,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
-await registerCommands();
+// コマンド登録の失敗 (レート制限等) で Bot 全体を落とさない: ログに留めてログインを続行する
+try {
+  await registerCommands();
+} catch (err) {
+  console.error("コマンド登録に失敗しましたが、Bot のログインは続行します:", err);
+}
 await client.login(config.token);

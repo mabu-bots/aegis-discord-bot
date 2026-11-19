@@ -22,8 +22,11 @@ export interface State {
   seenQuakes: Record<string, number>;
   // 津波: 通知済み id
   seenTsunamis: string[];
-  // EEW: key -> 通知したかどうか (取消報は「通知済みの速報」に対してだけ送る)
-  seenEews: Record<string, boolean>;
+  // EEW: key -> 通知済みの最大推定震度 (続報で推定震度が上がったら再通知するため)。
+  // 取消報のキー (末尾 "-cancel") には 1 = 通知済み / 0 = 未通知のまま見た、を記録する。
+  // 旧形式 (boolean) の値は読み込み時の型検証で破棄される (古い EEW は
+  // monitor 側の staleness ガードで再通知されない)。
+  seenEews: Record<string, number>;
   // 初回起動時の priming (既存情報を一斉通知しない) が済んだか
   primed: boolean;
 }
@@ -37,6 +40,52 @@ const SEEN_TSUNAMIS_CAP = 100;
 const SEEN_EEWS_CAP = 300;
 
 // ----- 3.2 読み書き -----
+// 読み込んだ JSON をフィールドごとに型検証し、正しい要素だけを採用する。
+// 型の崩れた要素は黙って混ぜずに落とす (壊れた値で通知判定が狂うのを防ぐ)。
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function validSubscriptions(v: unknown): Subscription[] {
+  if (!Array.isArray(v)) return [];
+  return v.filter(
+    (s): s is Subscription =>
+      isRecord(s) &&
+      typeof s.guildId === "string" &&
+      typeof s.channelId === "string" &&
+      typeof s.minScale === "number" &&
+      Number.isFinite(s.minScale) &&
+      typeof s.eew === "boolean" &&
+      typeof s.strongMention === "boolean",
+  );
+}
+
+function validNumberRecord(v: unknown): Record<string, number> {
+  if (!isRecord(v)) return {};
+  return Object.fromEntries(
+    Object.entries(v).filter(
+      (entry): entry is [string, number] =>
+        typeof entry[1] === "number" && Number.isFinite(entry[1]),
+    ),
+  );
+}
+
+function validStringArray(v: unknown): string[] {
+  if (!Array.isArray(v)) return [];
+  return v.filter((s): s is string => typeof s === "string");
+}
+
+export function validateState(parsed: unknown): State {
+  const state = emptyState();
+  if (!isRecord(parsed)) return state;
+  state.subscriptions = validSubscriptions(parsed.subscriptions);
+  state.seenQuakes = validNumberRecord(parsed.seenQuakes);
+  state.seenTsunamis = validStringArray(parsed.seenTsunamis);
+  state.seenEews = validNumberRecord(parsed.seenEews);
+  state.primed = parsed.primed === true;
+  return state;
+}
+
 export class Store {
   private state: State;
   private readonly path: string;
@@ -46,12 +95,23 @@ export class Store {
     this.state = emptyState();
     if (existsSync(path)) {
       try {
-        const parsed = JSON.parse(readFileSync(path, "utf-8"));
-        if (parsed && typeof parsed === "object") {
-          this.state = { ...emptyState(), ...parsed };
+        const parsed: unknown = JSON.parse(readFileSync(path, "utf-8"));
+        if (!isRecord(parsed)) throw new Error("状態ファイルの形式が不正です");
+        this.state = validateState(parsed);
+      } catch (err) {
+        // 壊れた状態ファイルで監視を止めない: 空の状態で起動する。
+        // ただし無言で上書きすると復旧不能になるため、別名へ退避してログを残す。
+        const backupPath = `${path}.corrupt-${Date.now()}`;
+        try {
+          renameSync(path, backupPath);
+          console.error(
+            `状態ファイルが破損しているため ${backupPath} へ退避し、空の状態で起動します: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        } catch {
+          console.error(
+            `状態ファイルの読み込みに失敗し、退避もできませんでした。空の状態で起動します: ${err instanceof Error ? err.message : String(err)}`,
+          );
         }
-      } catch {
-        // 壊れた状態ファイルで監視を止めない: 空の状態で起動する
         this.state = emptyState();
       }
     }

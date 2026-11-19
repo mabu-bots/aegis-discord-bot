@@ -60,6 +60,21 @@ export const commandBuilders = [
 export const commandData = commandBuilders.map((b) => b.toJSON());
 
 // ----- 7.2 ハンドラ -----
+// 管理系コマンドは宣言 (setDefaultMemberPermissions) だけでなくハンドラ側でも
+// 明示チェックする (インテグレーション権限を上書きされた構成への多層防御)
+function hasManageGuild(interaction: ChatInputCommandInteraction): boolean {
+  return interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild) ?? false;
+}
+
+async function denyWithoutManageGuild(interaction: ChatInputCommandInteraction): Promise<boolean> {
+  if (hasManageGuild(interaction)) return false;
+  await interaction.reply({
+    content: "このコマンドの実行にはサーバー管理権限 (ManageGuild) が必要です。",
+    ephemeral: true,
+  });
+  return true;
+}
+
 export async function handleCommand(
   interaction: ChatInputCommandInteraction,
   store: Store,
@@ -107,7 +122,11 @@ async function handleWeather(interaction: ChatInputCommandInteraction): Promise<
   }
   const geo = await geocode(place);
   if (!geo) {
-    await interaction.editReply(`「${place}」という地名が見つかりませんでした。`);
+    // ユーザー入力を公開返信へ埋め込むため、メンションとして発火しないよう制限する
+    await interaction.editReply({
+      content: `「${place}」という地名が見つかりませんでした。`,
+      allowedMentions: { parse: [] },
+    });
     return;
   }
   const report = await fetchWeather(geo.lat, geo.lon, geo.displayName);
@@ -118,6 +137,7 @@ async function handleWatch(
   interaction: ChatInputCommandInteraction,
   store: Store,
 ): Promise<void> {
+  if (await denyWithoutManageGuild(interaction)) return;
   if (!interaction.guildId || !interaction.channel || interaction.channel.type !== ChannelType.GuildText) {
     await interaction.reply({ content: "テキストチャンネルで実行してください。", ephemeral: true });
     return;
@@ -138,7 +158,10 @@ async function handleWatch(
       `・地震: 震度${scaleLabel(minScale)}以上\n` +
       `・津波: すべて (解除を含む)\n` +
       `・緊急地震速報: ${eew ? "通知する" : "通知しない"}\n` +
-      `・震度5弱以上での @everyone: ${strongMention ? "付ける" : "付けない"}`,
+      `・震度5弱以上での @everyone: ${strongMention ? "付ける" : "付けない"}` +
+      (strongMention
+        ? `\n※ @everyone を実際に ping するには、Bot に「全員にメンション (Mention Everyone)」権限が必要です。`
+        : ``),
     ephemeral: true,
   });
 }
@@ -147,6 +170,7 @@ async function handleUnwatch(
   interaction: ChatInputCommandInteraction,
   store: Store,
 ): Promise<void> {
+  if (await denyWithoutManageGuild(interaction)) return;
   if (!interaction.guildId) {
     await interaction.reply({ content: "サーバー内で実行してください。", ephemeral: true });
     return;
