@@ -9,11 +9,15 @@ import { Monitor, type PlannedMessage } from "./monitor.js";
 import { scaleLabel } from "./sources/p2p.js";
 import { fetchEews, fetchQuakes, fetchTsunamis } from "./sources/p2p.js";
 import { Store } from "./store.js";
+import { attachReadyWatchdog } from "./watchdog.js";
 
 const config = loadConfig();
 const store = new Store(config.statePath);
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+// Gateway安全構造: READY が来ないサイレント停滞を検知して終了する (watchdog.ts)
+attachReadyWatchdog(client);
 
 // ----- 8.1 コマンド登録 (起動時に自動) -----
 async function registerCommands(): Promise<void> {
